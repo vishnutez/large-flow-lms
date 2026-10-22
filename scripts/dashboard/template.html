@@ -1,0 +1,837 @@
+<title>Lafa Decoding Trajectories</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: control rail on top (header, transport, pass strip), then a two-column
+   workspace: sequence + attention on the left, block distributions + embedding path on the right. */
+:root {
+  --bg: #0c0d0f;
+  --panel: #131518;
+  --raised: #1a1d21;
+  --line: #262a30;
+  --fg: #e4e6e9;
+  --muted: #8b919a;
+  --faint: #5a616b;
+  --accent: #7d9cc0;
+  --accent-ink: #0c0d0f;
+  --accent-soft: rgba(125, 156, 192, 0.16);
+  --heat: 125, 156, 192;
+  --good: #8fae93;
+  --bad: #c08787;
+  --font-ui: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  --radius: 6px;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f4f5f6; --panel: #ffffff; --raised: #eef0f2; --line: #dcdfe3;
+    --fg: #15171a; --muted: #5b616a; --faint: #9aa0a8;
+    --accent: #3f6590; --accent-ink: #ffffff; --accent-soft: rgba(63, 101, 144, 0.12);
+    --heat: 63, 101, 144; --good: #3f7a4a; --bad: #a14848;
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f4f5f6; --panel: #ffffff; --raised: #eef0f2; --line: #dcdfe3;
+  --fg: #15171a; --muted: #5b616a; --faint: #9aa0a8;
+  --accent: #3f6590; --accent-ink: #ffffff; --accent-soft: rgba(63, 101, 144, 0.12);
+  --heat: 63, 101, 144; --good: #3f7a4a; --bad: #a14848;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font: 14px/1.5 var(--font-ui);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 40px;
+}
+.wrap { max-width: 1440px; margin: 0 auto; display: grid; gap: 14px; }
+h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+h2 {
+  font-size: 11px; font-weight: 500; margin: 0; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.mono { font-family: var(--font-mono); }
+.muted { color: var(--muted); }
+button, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* header */
+header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between; }
+.brand { display: grid; gap: 2px; }
+.brand p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.pickers { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.seg button {
+  background: transparent; border: 0; padding: 5px 12px; cursor: pointer; color: var(--muted);
+  border-left: 1px solid var(--line); font-size: 13px;
+}
+.seg button:first-child { border-left: 0; }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--fg); }
+.seg button:hover { color: var(--fg); }
+
+.question {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start;
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 12px 0;
+}
+.question p { margin: 0; max-width: 90ch; font-size: 13.5px; }
+.stats { display: flex; flex-wrap: wrap; gap: 18px; font-variant-numeric: tabular-nums; }
+.stat { display: grid; gap: 0; }
+.stat b { font-family: var(--font-mono); font-weight: 500; font-size: 15px; }
+.stat span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 13px; }
+.pill.ok b { color: var(--good); }
+.pill.no b { color: var(--bad); }
+
+/* transport */
+.transport {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 16px; align-items: center;
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5;
+  background: var(--bg); padding: 10px 0 8px; border-bottom: 1px solid var(--line);
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px);
+  z-index: 10; background: var(--bg);
+}
+.buttons { display: flex; gap: 4px; }
+.buttons button {
+  width: 34px; height: 30px; border: 1px solid var(--line); background: var(--panel);
+  border-radius: var(--radius); cursor: pointer; font-family: var(--font-mono); font-size: 13px;
+}
+.buttons button:hover { border-color: var(--faint); }
+.buttons button.play[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.caption { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; min-width: 0; }
+.caption .where { font-weight: 600; }
+.caption .role { color: var(--accent); font-family: var(--font-mono); font-size: 13px; }
+.caption .note { color: var(--muted); font-size: 12.5px; }
+.caption .counter { margin-left: auto; color: var(--muted); font-family: var(--font-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.strip { grid-column: 1 / -1; display: grid; gap: 6px; }
+#strip { width: 100%; height: 26px; display: block; cursor: pointer; border-radius: 3px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+/* workspace */
+.work { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.col { display: grid; gap: 14px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; display: grid; gap: 10px; min-width: 0; }
+.panel-head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; justify-content: space-between; }
+.panel-head .hint { font-size: 12px; color: var(--muted); }
+
+/* sequence */
+.seq {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.9; white-space: pre-wrap; word-break: break-word;
+  max-height: 46vh; overflow-y: auto; padding-right: 4px;
+}
+.tok { border-radius: 3px; padding: 1px 0; cursor: default; }
+.tok.prompt { color: var(--faint); }
+.tok.done { color: var(--fg); }
+.tok.special { font-size: 10.5px; color: var(--faint); border: 1px solid var(--line); padding: 0 3px; margin: 0 1px; }
+.tok.slot {
+  outline: 1px solid var(--accent); outline-offset: 0; color: var(--fg); cursor: pointer; padding: 1px 2px; margin: 0 1px;
+}
+.tok.slot.sel { background: var(--accent); color: var(--accent-ink); }
+.tok.slot.rejected { text-decoration: line-through; outline-color: var(--bad); color: var(--bad); }
+.tok.slot.accepted { outline-color: var(--good); }
+.tok.slot.next { outline-style: dashed; outline-color: var(--faint); color: var(--muted); }
+.tok.newline::after { content: "↵"; color: var(--faint); font-size: 10px; }
+
+/* attention */
+.attn-list { display: grid; gap: 3px; }
+.attn-row { display: grid; grid-template-columns: 4.5em minmax(0, 1fr) 3.4em; gap: 10px; align-items: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.attn-row .k { font-family: var(--font-mono); color: var(--muted); text-align: right; }
+.attn-row .bar { height: 16px; background: var(--raised); border-radius: 2px; position: relative; overflow: hidden; }
+.attn-row .bar i { position: absolute; inset: 0 auto 0 0; background: rgba(var(--heat), 0.55); }
+.attn-row .bar span { position: relative; padding: 0 6px; font-family: var(--font-mono); white-space: pre; line-height: 16px; }
+.attn-row .v { font-family: var(--font-mono); color: var(--muted); text-align: right; }
+
+/* distributions */
+.cols { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.dist { display: grid; gap: 4px; align-content: start; border-radius: var(--radius); padding: 6px; border: 1px solid transparent; cursor: pointer; min-width: 0; }
+.dist:hover { border-color: var(--line); }
+.dist.sel { border-color: var(--accent); background: var(--accent-soft); }
+.dist-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11px; color: var(--muted); }
+.dist-head b { font-family: var(--font-mono); font-weight: 500; color: var(--fg); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.dist-head .st-ok { color: var(--good); }
+.dist-head .st-no { color: var(--bad); }
+.cand { display: grid; grid-template-columns: minmax(0, 1fr) 3em; gap: 4px; align-items: center; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.cand .bar { position: relative; height: 17px; background: var(--raised); border-radius: 2px; overflow: hidden; }
+.cand .bar i { position: absolute; inset: 0 auto 0 0; background: var(--line); }
+.cand.final .bar i { background: var(--accent); opacity: 0.55; }
+.cand .bar span { position: relative; padding: 0 5px; font-family: var(--font-mono); white-space: pre; line-height: 17px; }
+.cand .p { font-family: var(--font-mono); color: var(--muted); text-align: right; }
+.spark { width: 100%; height: 34px; display: block; }
+.dist-foot { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); font-family: var(--font-mono); }
+.subhead { font-size: 12px; color: var(--muted); }
+
+/* embedding */
+.emb { display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 12px; align-items: start; }
+#scatter { width: 100%; aspect-ratio: 4 / 3; max-width: 100%; display: block; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); }
+.mini { display: grid; gap: 10px; }
+.mini svg { width: 100%; height: 70px; display: block; }
+.mini figcaption { font-size: 11px; color: var(--muted); }
+.mini figure { margin: 0; display: grid; gap: 2px; }
+.keyline { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); }
+.keyline span::before { content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px; border-radius: 50%; }
+.keyline .kz::before { background: var(--accent); }
+.keyline .kp::before { border: 1.5px solid var(--fg); }
+.keyline .kc::before { background: var(--faint); border-radius: 1px; transform: rotate(45deg) scale(0.8); }
+.keyline .kt::before { background: var(--muted); width: 6px; height: 6px; }
+.empty { color: var(--muted); font-size: 13px; padding: 18px 4px; }
+
+@media (max-width: 1000px) {
+  .work { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .question { grid-template-columns: minmax(0, 1fr); }
+  .cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .emb { grid-template-columns: minmax(0, 1fr); }
+  .caption .counter { margin-left: 0; }
+  .transport { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1>Lafa decoding trajectories</h1>
+      <p id="subtitle"></p>
+    </div>
+    <div class="pickers">
+      <div class="seg" id="problem-seg" role="group" aria-label="Problem"></div>
+      <div class="seg" id="mode-seg" role="group" aria-label="Decoding mode"></div>
+    </div>
+  </header>
+
+  <section class="question">
+    <p id="question"></p>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="transport" aria-label="Playback">
+    <div class="buttons">
+      <button id="first" title="First pass (Home)" aria-label="First pass">|◀</button>
+      <button id="prev" title="Previous pass (←)" aria-label="Previous pass">◀</button>
+      <button id="play" class="play" title="Play (Space)" aria-label="Play" aria-pressed="false">▶︎</button>
+      <button id="next" title="Next pass (→)" aria-label="Next pass">▶</button>
+      <button id="last" title="Last pass (End)" aria-label="Last pass">▶|</button>
+    </div>
+    <div class="caption" id="caption"></div>
+    <div class="strip">
+      <canvas id="strip" aria-label="Forward passes; click to jump"></canvas>
+      <div class="legend" id="legend"></div>
+    </div>
+  </section>
+
+  <div class="work">
+    <div class="col">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Sequence</h2>
+          <span class="hint">Shading shows attention from the selected slot. Click an outlined slot to select it.</span>
+        </div>
+        <div class="seq" id="seq"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="attn-title">Attention</h2>
+          <div class="seg" id="layer-seg" role="group" aria-label="Layer group"></div>
+        </div>
+        <div class="attn-list" id="attn"></div>
+      </section>
+    </div>
+    <div class="col">
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="dist-title">Block distributions</h2>
+          <span class="hint" id="dist-hint"></span>
+        </div>
+        <div id="dist"></div>
+      </section>
+      <section class="panel" id="emb-panel">
+        <div class="panel-head">
+          <h2>Embedding path</h2>
+          <div class="keyline"><span class="kz">state e<sub>t</sub></span><span class="kp">predicted clean</span><span class="kc">guided estimate</span><span class="kt">candidate tokens</span></div>
+        </div>
+        <div id="emb"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script type="application/json" id="traces">/*__TRACES__*/</script>
+<script>
+(() => {
+  const TRACES = JSON.parse(document.getElementById('traces').textContent);
+  const $ = (id) => document.getElementById(id);
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const MODE_LABEL = { flow: 'Flow', speculative: 'Self-speculative' };
+  const GROUPS = ['All layers', 'Early', 'Early-mid', 'Late-mid', 'Late'];
+
+  const problems = [...new Set(TRACES.map((t) => t.meta.qid))];
+  const state = { qid: problems[0], mode: TRACES[0].meta.mode, pass: 0, row: 0, group: 0, playing: null };
+  let T = null;            // current trace
+  const attnCache = new Map();
+
+  // ---------- token helpers ----------
+  const tokText = (id) => (T.vocab[id] ?? `<${id}>`);
+  const isSpecial = (s) => /^<\|.*\|>$/.test(s);
+  function showTok(id) {
+    const s = tokText(id);
+    if (isSpecial(s)) return s;
+    return s.replace(/\n/g, '↵').replace(/\t/g, '⇥') || '∅';
+  }
+
+  // ---------- pass semantics ----------
+  function passInfo(p) {
+    const r = p.role;
+    if (r === 'prefill') return { group: 'prefill', label: 'prefill', note: 'Encodes the prompt into the KV cache.' };
+    if (r === 'commit') return { group: 'commit', label: 'commit', note: 'Writes the finished block into the cache. Not counted in tokens per forward.' };
+    if (r === 'draft') return { group: 'draft', label: 'bootstrap draft', note: 'One-step draft of the first block from noise.' };
+    if (r === 'recover') return { group: 'recover', label: 'correction + draft', note: 'The first drafted token was rejected; commits the AR prediction and drafts the next block.' };
+    if (r === 'fused') return { group: 'fused', label: 'verify + draft', note: 'Checks the drafted block against AR predictions and drafts successors for every acceptance length in one pass.' };
+    const [step, kind] = r.split(':');
+    const cond = kind === 'cond';
+    const stepLabel = step === 'sc-init' ? 'self-conditioning start' : `Euler ${step.replace('step', 'step ')}`;
+    return {
+      group: step === 'sc-init' ? (cond ? 'sc' : 'sc-u') : (cond ? 'cond' : 'uncond'),
+      label: `${stepLabel} · ${cond ? 'conditional' : 'unconditional'}`,
+      note: cond ? 'Block slots see the prefix and each other.' : 'Prefix keys are hidden; used for prefix guidance.',
+    };
+  }
+  const STRIP = {
+    prefill: ['--faint', 'Prefill'], sc: ['--muted', 'Self-cond start'], 'sc-u': ['--line', 'Self-cond start (uncond)'],
+    cond: ['--accent', 'Euler step, conditional'], uncond: ['--faint', 'Euler step, unconditional'],
+    commit: ['--raised', 'Commit (not counted)'], draft: ['--muted', 'Bootstrap draft'],
+    fused: ['--accent', 'Verify + draft'], recover: ['--bad', 'Correction + draft'],
+  };
+
+  function decodeAttn(p) {
+    if (!p.attn) return null;
+    if (attnCache.has(p)) return attnCache.get(p);
+    const bin = atob(p.attn);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    attnCache.set(p, arr);
+    return arr;
+  }
+  function attnRow(p, row, group) {
+    const arr = decodeAttn(p);
+    if (!arr) return null;
+    const off = (group * p.rows + row) * p.keys;
+    return arr.subarray(off, off + p.keys);
+  }
+
+  // Speculative fused layout: drafts at i*(N+1), noise slot k of block i at i*(N+1)+1+k.
+  function fusedSlot(N, idx) {
+    const i = Math.floor(idx / (N + 1)), k = idx % (N + 1);
+    return k === 0 ? { kind: 'draft', i } : { kind: 'noise', i, k: k - 1 };
+  }
+
+  // ---------- selection ----------
+  function selectTrace() {
+    T = TRACES.find((t) => t.meta.qid === state.qid && t.meta.mode === state.mode)
+      || TRACES.find((t) => t.meta.qid === state.qid);
+    state.mode = T.meta.mode;
+    attnCache.clear();
+    state.pass = Math.min(state.pass, T.passes.length - 1);
+    if (state.pass === 0) state.pass = firstInteresting();
+    state.row = defaultRow(T.passes[state.pass]);
+    renderStatic();
+    render();
+  }
+  function firstInteresting() {
+    const i = T.passes.findIndex((p) => p.role !== 'prefill');
+    return i < 0 ? 0 : i;
+  }
+  function defaultRow(p) {
+    if (!p || !p.rows) return 0;
+    if (p.role === 'fused') return 0;
+    if (p.role === 'recover') return 0;
+    return Math.min(state.row ?? 0, p.rows - 1);
+  }
+
+  // ---------- static parts ----------
+  function renderStatic() {
+    const m = T.meta;
+    $('subtitle').textContent = `${m.tag} · block size ${m.block_size} · GSM8K test #${m.qid}`;
+    $('problem-seg').innerHTML = problems.map((q) => {
+      const t = TRACES.find((x) => x.meta.qid === q && x.meta.mode === state.mode) || TRACES.find((x) => x.meta.qid === q);
+      const mark = t.meta.correct ? '✓' : '✗';
+      return `<button aria-pressed="${q === state.qid}" data-q="${q}">#${q} <span class="${t.meta.correct ? 'muted' : ''}">${mark}</span></button>`;
+    }).join('');
+    const modes = [...new Set(TRACES.filter((t) => t.meta.qid === state.qid).map((t) => t.meta.mode))];
+    $('mode-seg').innerHTML = modes.map((md) => `<button aria-pressed="${md === state.mode}" data-mode="${md}">${MODE_LABEL[md] || md}</button>`).join('');
+    $('question').textContent = m.question;
+    const s = m.settings;
+    const setting = m.mode === 'flow'
+      ? `${s.num_steps} Euler steps · guidance ${s.cfg_scale} · noise ${s.noise_scale}${s.self_cond ? ' · self-cond' : ''}`
+      : `one-step drafts · greedy AR verification`;
+    $('stats').innerHTML = `
+      <div class="stat"><b>${m.gen_len}</b><span>tokens</span></div>
+      <div class="stat"><b>${m.forwards}</b><span>forwards</span></div>
+      <div class="stat"><b>${m.tpf.toFixed(2)}</b><span>tokens / forward</span></div>
+      <div class="stat"><span class="pill ${m.correct ? 'ok' : 'no'}"><b>${m.correct ? '✓' : '✗'} ${esc(String(m.extracted))}</b></span><span>answer · ref ${esc(m.reference)}</span></div>
+      <div class="stat"><b class="muted" style="font-size:12px;font-family:var(--font-ui)">${setting}</b><span>${MODE_LABEL[m.mode]}</span></div>`;
+    $('layer-seg').innerHTML = GROUPS.map((g, i) => {
+      const lg = i === 0 ? `0–${m.num_layers - 1}` : `${m.layer_groups[i - 1][0]}–${m.layer_groups[i - 1][1] - 1}`;
+      return `<button aria-pressed="${i === state.group}" data-g="${i}" title="Layers ${lg}">${g}</button>`;
+    }).join('');
+    const used = new Set(T.passes.map((p) => passInfo(p).group));
+    $('legend').innerHTML = Object.entries(STRIP).filter(([k]) => used.has(k))
+      .map(([, [c, l]]) => `<span><i style="background:var(${c})"></i>${l}</span>`).join('');
+    $('emb-panel').hidden = m.mode !== 'flow';
+  }
+
+  // ---------- main render ----------
+  function render() {
+    const p = T.passes[state.pass];
+    const info = passInfo(p);
+    renderCaption(p, info);
+    drawStrip();
+    renderSequence(p);
+    renderAttention(p);
+    renderDistributions(p);
+    if (T.meta.mode === 'flow') renderEmbedding(p);
+  }
+
+  function blockOf(p) {
+    return p.block != null ? T.blocks[p.block] : null;
+  }
+
+  function renderCaption(p, info) {
+    let where = '';
+    if (p.block != null) {
+      const nb = T.blocks.length;
+      where = `Block ${p.block + 1} of ${nb}`;
+    } else if (p.role === 'commit') {
+      where = `Commit ${p.ids ? p.ids.length : 0} tokens`;
+    } else if (T.meta.mode === 'speculative' && p.role !== 'prefill') {
+      const done = p.ctx - T.meta.prompt_len;
+      where = `${done} tokens committed`;
+    } else {
+      where = `Prompt · ${T.meta.prompt_len} tokens`;
+    }
+    const t = p.t && p.role !== 'commit' ? `<span class="note mono">t = ${p.t.map((x) => x.toFixed(2)).join(' ')}</span>` : '';
+    $('caption').innerHTML = `<span class="where">${where}</span><span class="role">${info.label}</span>${t}
+      <span class="note">${info.note}</span>
+      <span class="counter">pass ${state.pass + 1} / ${T.passes.length}</span>`;
+  }
+
+  function drawStrip() {
+    const cv = $('strip');
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+    const ctx = cv.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    const n = T.passes.length, cw = w / n;
+    const colors = {};
+    for (const [k, [c]] of Object.entries(STRIP)) colors[k] = css(c);
+    const gap = cw > 3 ? 1 : 0;
+    T.passes.forEach((p, i) => {
+      ctx.fillStyle = colors[passInfo(p).group] || css('--faint');
+      const top = p.role === 'commit' ? h * 0.35 : 4;
+      ctx.fillRect(i * cw, top, Math.max(cw - gap, 0.6), h - top - 4);
+    });
+    const x = (state.pass + 0.5) * cw;
+    ctx.fillStyle = css('--fg');
+    ctx.fillRect(Math.round(x) - 1, 0, 2, h);
+  }
+
+  function renderSequence(p) {
+    const m = T.meta, ids = T.ids, N = m.block_size;
+    const ctxLen = p.role === 'prefill' ? m.prompt_len : p.ctx;
+    const heat = currentHeat(p);
+    const parts = [];
+    for (let j = 0; j < Math.min(ctxLen, ids.length); j++) {
+      const s = tokText(ids[j]);
+      const cls = isSpecial(s) ? 'tok special' : (j < m.prompt_len ? 'tok prompt' : 'tok done');
+      const a = heat ? heat[j] : 0;
+      const style = a > 0.02 ? ` style="background:rgba(var(--heat),${(Math.sqrt(a) * 0.85).toFixed(3)})"` : '';
+      parts.push(`<span class="${cls}${s.includes('\n') ? ' newline' : ''}"${style} title="#${j}">${esc(s.replace(/\n/g, ''))}</span>${s.includes('\n') ? '\n'.repeat((s.match(/\n/g) || []).length) : ''}`);
+    }
+    for (const slot of activeSlots(p)) {
+      const cls = ['tok', 'slot', slot.cls || ''];
+      if (slot.row === state.row && slot.selectable) cls.push('sel');
+      const op = slot.conf != null ? ` style="opacity:${(0.35 + 0.65 * slot.conf).toFixed(2)}"` : '';
+      parts.push(`<span class="${cls.join(' ')}" data-row="${slot.row}"${op} title="${esc(slot.title || '')}">${esc(showTok(slot.id))}</span>`);
+    }
+    const el = $('seq');
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+    el.innerHTML = parts.join('');
+    if (atBottom || state.followScroll) {
+      const sel = el.querySelector('.slot');
+      if (sel) sel.scrollIntoView({ block: 'nearest' });
+      else el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  // Slots shown after the committed context for the current pass.
+  function activeSlots(p) {
+    const N = T.meta.block_size;
+    if (p.role === 'prefill') return [];
+    if (p.role === 'commit') return (p.ids || []).map((id, r) => ({ id, row: -1, cls: 'accepted', title: 'committed' }));
+    if (T.meta.mode === 'flow') {
+      return p.topk.map((row, r) => ({ id: row[0][0], row: r, conf: row[0][1], selectable: true,
+        title: `slot ${r}: ${showTok(row[0][0])} p=${row[0][1]}` }));
+    }
+    if (p.role === 'draft') return p.draft.map((id, r) => ({ id, row: r, selectable: true, cls: 'next', title: 'draft' }));
+    if (p.role === 'recover') {
+      return [
+        { id: p.proposed[0], row: -1, cls: 'rejected', title: 'rejected draft token' },
+        { id: p.accepted[0], row: 0, selectable: true, cls: 'accepted', title: 'AR correction' },
+        ...p.draft.map((id, k) => ({ id, row: 1 + k, selectable: true, cls: 'next', title: 'next draft' })),
+      ];
+    }
+    if (p.role === 'fused') {
+      const j = p.accepted.length;
+      const slots = p.proposed.map((id, i) => ({
+        id, row: i * (N + 1), selectable: true, cls: i < j ? 'accepted' : 'rejected',
+        title: i < j ? 'accepted' : 'rejected',
+      }));
+      const w = p.window;
+      p.draft.forEach((id, k) => slots.push({ id, row: w * (N + 1) + 1 + k, selectable: true, cls: 'next', title: 'next draft' }));
+      return slots;
+    }
+    return [];
+  }
+
+  function currentHeat(p) {
+    if (!p.attn) return null;
+    const row = state.row >= 0 && state.row < p.rows ? state.row : 0;
+    const a = attnRow(p, row, state.group);
+    return a ? Array.from(a.subarray(0, p.ctx), (v) => v / 255) : null;
+  }
+
+  function slotName(p, idx) {
+    const N = T.meta.block_size;
+    if (T.meta.mode === 'flow') return `slot ${idx}`;
+    if (p.role === 'fused') {
+      const s = fusedSlot(N, idx);
+      return s.kind === 'draft' ? `draft d${s.i}` : `next a${s.i}.${s.k}`;
+    }
+    if (p.role === 'recover') return idx === 0 ? 'correction' : `next ${idx - 1}`;
+    return `draft ${idx}`;
+  }
+
+  function slotToken(p, idx) {
+    const N = T.meta.block_size;
+    if (T.meta.mode === 'flow') return p.topk[idx][0][0];
+    if (p.role === 'fused') {
+      const s = fusedSlot(N, idx);
+      return s.kind === 'draft' ? p.proposed[s.i] : null;
+    }
+    if (p.role === 'recover') return idx === 0 ? p.accepted[0] : p.draft[idx - 1];
+    return p.draft ? p.draft[idx] : null;
+  }
+
+  function renderAttention(p) {
+    const el = $('attn');
+    if (!p.attn) {
+      $('attn-title').textContent = 'Attention';
+      el.innerHTML = `<div class="empty">${p.role === 'prefill' ? 'Prefill encodes the prompt. Step forward to see block attention.' : 'Commit passes only write the cache; attention is not recorded.'}</div>`;
+      return;
+    }
+    const row = state.row >= 0 && state.row < p.rows ? state.row : 0;
+    const tid = slotToken(p, row);
+    $('attn-title').textContent = `Attention from ${slotName(p, row)}${tid != null ? ` (${showTok(tid)})` : ''}`;
+    const a = attnRow(p, row, state.group);
+    const items = [];
+    for (let k = 0; k < p.keys; k++) {
+      let label, pos;
+      if (k < p.ctx) { label = showTok(T.ids[k]); pos = `#${k}`; }
+      else {
+        const i = k - p.ctx;
+        label = slotName(p, i);
+        const t = slotToken(p, i);
+        if (t != null) label += ` ${showTok(t)}`;
+        pos = 'blk';
+      }
+      items.push({ k, v: a[k] / 255, label, pos });
+    }
+    items.sort((x, y) => y.v - x.v);
+    el.innerHTML = items.slice(0, 12).map((it) => `
+      <div class="attn-row"><span class="k">${it.pos}</span>
+        <span class="bar"><i style="width:${(it.v * 100).toFixed(1)}%"></i><span>${esc(it.label)}</span></span>
+        <span class="v">${it.v.toFixed(2)}</span></div>`).join('')
+      + `<div class="subhead">Head-averaged attention, scaled so the strongest key is 1.00. Bars list the 12 strongest keys.</div>`;
+  }
+
+  // ---------- distributions ----------
+  function candList(top, finalId, n = 8) {
+    return top.slice(0, n).map(([id, prob]) => `
+      <div class="cand${id === finalId ? ' final' : ''}">
+        <span class="bar"><i style="width:${(prob * 100).toFixed(1)}%"></i><span>${esc(showTok(id))}</span></span>
+        <span class="p">${prob < 0.001 ? '<.001' : prob.toFixed(3)}</span></div>`).join('');
+  }
+
+  function sparkline(values, current) {
+    const w = 120, h = 34, n = values.length;
+    if (n < 2) return '';
+    const x = (i) => 2 + (i / (n - 1)) * (w - 4), y = (v) => h - 3 - v * (h - 6);
+    const pts = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+    const area = `M${x(0)},${h - 3} L${pts.split(' ').join(' L')} L${x(n - 1)},${h - 3} Z`;
+    const ci = Math.max(0, Math.min(current, n - 1));
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <line x1="0" x2="${w}" y1="${y(0.5)}" y2="${y(0.5)}" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/>
+      <path d="${area}" fill="var(--accent-soft)"/>
+      <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+      <circle cx="${x(ci)}" cy="${y(values[ci])}" r="2.6" fill="var(--fg)"/></svg>`;
+  }
+
+  function renderDistributions(p) {
+    const el = $('dist');
+    const N = T.meta.block_size;
+    if (p.role === 'prefill' || p.role === 'commit') {
+      $('dist-title').textContent = 'Block distributions';
+      $('dist-hint').textContent = '';
+      el.innerHTML = `<div class="empty">${p.role === 'prefill' ? 'No block is being decoded during prefill.' : `Committed: ${(p.ids || []).map((i) => `<span class="mono">${esc(showTok(i))}</span>`).join(' · ')}`}</div>`;
+      return;
+    }
+    if (T.meta.mode === 'flow') return renderFlowDist(p, el, N);
+    return renderSpecDist(p, el, N);
+  }
+
+  function renderFlowDist(p, el, N) {
+    const block = blockOf(p);
+    $('dist-title').textContent = 'Block distributions';
+    $('dist-hint').textContent = `Top ${p.topk[0].length} tokens per slot · blue marks the token finally chosen`;
+    const blockPasses = T.passes.filter((q) => q.block === p.block && q.role.endsWith(':cond'));
+    const curIdx = blockPasses.findIndex((q) => q.i >= p.i && q.i === p.i) >= 0
+      ? blockPasses.findIndex((q) => q.i === p.i) : blockPasses.filter((q) => q.i < p.i).length - 1;
+    el.innerHTML = `<div class="cols">${p.topk.map((top, r) => {
+      const pos = block && block.positions[r];
+      const finalId = pos ? pos.final : null;
+      const traj = blockPasses.map((q) => {
+        const hit = q.topk[r].find(([id]) => id === finalId);
+        return hit ? hit[1] : 0;
+      });
+      return `<div class="dist${r === state.row ? ' sel' : ''}" data-row="${r}" role="button" tabindex="0" aria-label="Select slot ${r}">
+        <div class="dist-head"><span>slot ${r}${p.t ? ` · t ${p.t[r].toFixed(2)}` : ''}</span><b>${finalId != null ? esc(showTok(finalId)) : ''}</b></div>
+        ${candList(top, finalId)}
+        ${sparkline(traj, curIdx)}
+        <div class="dist-foot"><span>p(final) by step</span><span>H ${p.entropy[r].toFixed(2)}</span></div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+
+  function renderSpecDist(p, el, N) {
+    const verifyTop = (i) => {
+      if (p.role !== 'fused') return null;
+      if (i === 0) return p.check ? p.check.topk : null;
+      return p.topk[(i - 1) * (N + 1)];
+    };
+    if (p.role === 'draft') {
+      $('dist-title').textContent = 'Bootstrap draft';
+      $('dist-hint').textContent = 'One-step draft from noise, conditioned on the prompt';
+      el.innerHTML = `<div class="cols">${p.topk.map((top, r) => `
+        <div class="dist${r === state.row ? ' sel' : ''}" data-row="${r}" role="button" tabindex="0">
+          <div class="dist-head"><span>slot ${r}</span><b>${esc(showTok(p.draft[r]))}</b></div>${candList(top, p.draft[r])}</div>`).join('')}</div>`;
+      return;
+    }
+    if (p.role === 'recover') {
+      $('dist-title').textContent = 'Rejected draft, correction and next draft';
+      $('dist-hint').textContent = 'The AR prediction disagreed with the first drafted token';
+      el.innerHTML = `
+        <div class="cols">
+          <div class="dist"><div class="dist-head"><span>AR check for d0</span><b class="st-no">✗ ${esc(showTok(p.proposed[0]))}</b></div>
+            ${candList(p.check.topk, p.accepted[0], 6)}
+            <div class="dist-foot"><span>p(draft) ${p.check.proposed_p.toFixed(3)}</span><span></span></div></div>
+          ${p.draft.map((id, k) => `<div class="dist${state.row === 1 + k ? ' sel' : ''}" data-row="${1 + k}" role="button" tabindex="0">
+            <div class="dist-head"><span>next draft ${k}</span><b>${esc(showTok(id))}</b></div>${candList(p.topk[1 + k], id, 6)}</div>`).join('').replace(/^/, '')}
+        </div>`.replace('<div class="cols">', '<div class="cols" style="grid-template-columns:repeat(5,minmax(0,1fr))">');
+      return;
+    }
+    const j = p.accepted.length;
+    $('dist-title').textContent = `Verify ${p.proposed.length} drafted tokens · ${j} accepted`;
+    $('dist-hint').textContent = 'Each column is the AR prediction that checks a drafted token';
+    const verifyCols = p.proposed.map((id, i) => {
+      const top = verifyTop(i);
+      const status = i < j ? 'ok' : (i === j ? 'no' : 'skip');
+      const mark = status === 'ok' ? '✓' : status === 'no' ? '✗' : '·';
+      const row = i * (N + 1);
+      const foot = i === 0 ? `p(draft) ${p.check.proposed_p.toFixed(3)}` : `predicts ${esc(showTok(p.verify[i - 1]))}`;
+      return `<div class="dist${state.row === row ? ' sel' : ''}" data-row="${row}" role="button" tabindex="0">
+        <div class="dist-head"><span>d${i}</span><b class="${status === 'ok' ? 'st-ok' : status === 'no' ? 'st-no' : ''}">${mark} ${esc(showTok(id))}</b></div>
+        ${top ? candList(top, id, 6) : ''}
+        <div class="dist-foot"><span>${foot}</span></div></div>`;
+    }).join('');
+    const w = p.window;
+    const nextCols = p.draft.map((id, k) => {
+      const row = w * (N + 1) + 1 + k;
+      return `<div class="dist${state.row === row ? ' sel' : ''}" data-row="${row}" role="button" tabindex="0">
+        <div class="dist-head"><span>a${w}.${k}</span><b>${esc(showTok(id))}</b></div>${candList(p.topk[row], id, 6)}</div>`;
+    }).join('');
+    el.innerHTML = `<div class="cols">${verifyCols}</div>
+      <div class="subhead">Next draft, from the noise window that assumed ${j} accepted token${j === 1 ? '' : 's'}</div>
+      <div class="cols">${nextCols}</div>`;
+  }
+
+  // ---------- embedding path ----------
+  function renderEmbedding(p) {
+    const el = $('emb');
+    const block = blockOf(p);
+    if (!block) {
+      el.innerHTML = `<div class="empty">${p.role === 'commit' ? 'The block is finished; step forward to the next block.' : 'Step to a denoising pass to see a block’s embedding path.'}</div>`;
+      return;
+    }
+    const r = Math.max(0, Math.min(state.row, block.positions.length - 1));
+    const pos = block.positions[r];
+    if (!pos) { el.innerHTML = '<div class="empty">This slot falls beyond the generated text.</div>'; return; }
+    let cur = -1;
+    pos.passes.forEach((pi, k) => { if (pi <= p.i) cur = k; });
+    const all = [...pos.z, ...pos.pred, ...pos.cfg, ...pos.cands.map((c) => [c[1], c[2]])];
+    const xs = all.map((q) => q[0]), ys = all.map((q) => q[1]);
+    const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+    const W = 400, H = 300, pad = 34;
+    const sx = (v) => pad + ((v - x0) / (x1 - x0 || 1)) * (W - 2 * pad);
+    const sy = (v) => H - pad - ((v - y0) / (y1 - y0 || 1)) * (H - 2 * pad);
+    const cands = pos.cands.map(([id, x, y]) => {
+      const fin = id === pos.final;
+      const label = esc(showTok(id)).slice(0, 14);
+      return `<g><rect x="${sx(x) - 3}" y="${sy(y) - 3}" width="6" height="6" fill="${fin ? 'var(--accent)' : 'var(--faint)'}" transform="rotate(45 ${sx(x)} ${sy(y)})"/>
+        <text x="${sx(x) + 7}" y="${sy(y) + 3.5}" font-size="10.5" font-family="var(--font-mono)" fill="${fin ? 'var(--fg)' : 'var(--muted)'}">${label}</text></g>`;
+    }).join('');
+    const upto = pos.z.slice(0, cur + 1);
+    const path = upto.length > 1 ? `<polyline points="${upto.map(([x, y]) => `${sx(x)},${sy(y)}`).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="1.6"/>` : '';
+    const dots = upto.map(([x, y], k) => `<circle cx="${sx(x)}" cy="${sy(y)}" r="${k === cur ? 5 : 3}" fill="var(--accent)"${k === cur ? ' stroke="var(--fg)" stroke-width="1.2"' : ''}/>`).join('');
+    let predMarks = '';
+    if (cur >= 0) {
+      const [px, py] = pos.pred[cur], [gx, gy] = pos.cfg[cur], [zx, zy] = pos.z[cur];
+      predMarks = `<line x1="${sx(zx)}" y1="${sy(zy)}" x2="${sx(px)}" y2="${sy(py)}" stroke="var(--fg)" stroke-dasharray="3 3" stroke-width="1" opacity="0.6"/>
+        <circle cx="${sx(px)}" cy="${sy(py)}" r="6" fill="none" stroke="var(--fg)" stroke-width="1.5"/>
+        <rect x="${sx(gx) - 4}" y="${sy(gy) - 4}" width="8" height="8" fill="var(--faint)" transform="rotate(45 ${sx(gx)} ${sy(gy)})"/>`;
+    }
+    const nearest = cur >= 0 ? showTok(pos.nearest[cur]) : '';
+    const roleNames = pos.roles.map((ro) => ro.startsWith('sc-init') ? 'start' : ro.split(':')[0].replace('step', 's'));
+    el.innerHTML = `
+      <div class="emb">
+        <svg id="scatter" viewBox="0 0 ${W} ${H}" role="img" aria-label="2D projection of slot ${r} embedding trajectory">
+          <rect x="0" y="0" width="${W}" height="${H}" fill="var(--bg)"/>
+          ${cands}${path}${dots}${predMarks}
+          <text x="10" y="${H - 10}" font-size="10" fill="var(--faint)" font-family="var(--font-ui)">PCA of this slot's states, predictions and candidate embeddings</text>
+        </svg>
+        <div class="mini">
+          <div class="subhead">Slot ${r} → <span class="mono" style="color:var(--fg)">${esc(showTok(pos.final))}</span>${cur >= 0 ? `<br>nearest token to e<sub>t</sub>: <span class="mono">${esc(nearest)}</span>` : ''}</div>
+          <figure>${lineChart([pos.z_cos, pos.pred_cos], cur, [-0.1, 1], roleNames)}<figcaption>cosine to final token: state (blue), prediction (white)</figcaption></figure>
+          <figure>${lineChart([pos.z_norm, pos.pred_norm], cur, null, roleNames)}<figcaption>vector norm: state, prediction</figcaption></figure>
+        </div>
+      </div>`;
+  }
+
+  function lineChart(series, cur, range, names) {
+    const w = 190, h = 70, n = series[0].length, padL = 26, padB = 14;
+    const vals = series.flat();
+    let [lo, hi] = range || [Math.min(...vals), Math.max(...vals)];
+    if (hi - lo < 1e-6) { hi += 1; lo -= 1; }
+    const x = (i) => padL + (n > 1 ? (i / (n - 1)) * (w - padL - 4) : 0);
+    const y = (v) => 4 + (1 - (v - lo) / (hi - lo)) * (h - padB - 4);
+    const colors = ['var(--accent)', 'var(--fg)'];
+    const lines = series.map((s, k) => `<polyline points="${s.map((v, i) => `${x(i)},${y(v)}`).join(' ')}" fill="none" stroke="${colors[k]}" stroke-width="1.4"/>`).join('');
+    const marks = cur >= 0 ? series.map((s, k) => `<circle cx="${x(cur)}" cy="${y(s[cur])}" r="2.8" fill="${colors[k]}"/>`).join('') : '';
+    const fmt = (v) => Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(1);
+    const ticks = names.map((nm, i) => `<text x="${x(i)}" y="${h - 2}" font-size="8.5" text-anchor="middle" fill="var(--faint)" font-family="var(--font-mono)">${nm}</text>`).join('');
+    return `<svg viewBox="0 0 ${w} ${h}" aria-hidden="true">
+      <line x1="${padL}" x2="${w - 4}" y1="${y(lo)}" y2="${y(lo)}" stroke="var(--line)"/>
+      <line x1="${padL}" x2="${w - 4}" y1="${y(hi)}" y2="${y(hi)}" stroke="var(--line)" stroke-dasharray="2 3"/>
+      <text x="${padL - 4}" y="${y(hi) + 3}" font-size="8.5" text-anchor="end" fill="var(--faint)" font-family="var(--font-mono)">${fmt(hi)}</text>
+      <text x="${padL - 4}" y="${y(lo) + 3}" font-size="8.5" text-anchor="end" fill="var(--faint)" font-family="var(--font-mono)">${fmt(lo)}</text>
+      ${cur >= 0 ? `<line x1="${x(cur)}" x2="${x(cur)}" y1="4" y2="${h - padB}" stroke="var(--line)"/>` : ''}
+      ${lines}${marks}${ticks}</svg>`;
+  }
+
+  // ---------- navigation ----------
+  function go(i) {
+    const n = T.passes.length;
+    const next = Math.max(0, Math.min(n - 1, i));
+    if (next === state.pass) return;
+    const prevBlock = T.passes[state.pass].block, prevRole = T.passes[state.pass].role;
+    state.pass = next;
+    const p = T.passes[next];
+    if (p.rows && (state.row >= p.rows || (T.meta.mode === 'speculative' && p.role !== prevRole) || (p.block != null && p.block !== prevBlock && state.row >= T.meta.block_size))) {
+      state.row = defaultRow(p);
+    }
+    if (T.meta.mode === 'speculative' && !activeSlots(p).some((s) => s.row === state.row) && p.rows) state.row = defaultRow(p);
+    state.followScroll = true;
+    render();
+    state.followScroll = false;
+  }
+  function jumpBlock(dir) {
+    const p = T.passes[state.pass];
+    let i = state.pass + dir;
+    if (T.meta.mode === 'flow') {
+      const key = (q) => q.block ?? `c${q.ctx}`;
+      const k0 = key(p);
+      while (i > 0 && i < T.passes.length - 1 && key(T.passes[i]) === k0) i += dir;
+      if (dir < 0) { const k1 = key(T.passes[i]); while (i > 0 && key(T.passes[i - 1]) === k1) i--; }
+    } else {
+      i = state.pass + dir * 5;
+    }
+    go(i);
+  }
+  function setPlaying(on) {
+    clearInterval(state.playing);
+    state.playing = on ? setInterval(() => {
+      if (state.pass >= T.passes.length - 1) return setPlaying(false);
+      go(state.pass + 1);
+    }, 260) : null;
+    $('play').setAttribute('aria-pressed', String(!!on));
+    $('play').textContent = on ? '❚❚' : '▶︎';
+  }
+
+  $('first').onclick = () => go(firstInteresting());
+  $('prev').onclick = () => go(state.pass - 1);
+  $('next').onclick = () => go(state.pass + 1);
+  $('last').onclick = () => go(T.passes.length - 1);
+  $('play').onclick = () => setPlaying(!state.playing);
+  document.addEventListener('keydown', (e) => {
+    if (e.target.closest && e.target.closest('input, select, textarea')) return;
+    if (e.key === 'ArrowRight') { e.preventDefault(); e.shiftKey ? jumpBlock(1) : go(state.pass + 1); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); e.shiftKey ? jumpBlock(-1) : go(state.pass - 1); }
+    else if (e.key === ' ' && !e.target.closest('button')) { e.preventDefault(); setPlaying(!state.playing); }
+    else if (e.key === 'Home') { e.preventDefault(); go(firstInteresting()); }
+    else if (e.key === 'End') { e.preventDefault(); go(T.passes.length - 1); }
+  });
+  const strip = $('strip');
+  let dragging = false;
+  const seek = (e) => {
+    const rect = strip.getBoundingClientRect();
+    go(Math.floor(((e.clientX - rect.left) / rect.width) * T.passes.length));
+  };
+  strip.addEventListener('pointerdown', (e) => { dragging = true; strip.setPointerCapture(e.pointerId); seek(e); });
+  strip.addEventListener('pointermove', (e) => { if (dragging) seek(e); });
+  strip.addEventListener('pointerup', () => { dragging = false; });
+
+  document.addEventListener('click', (e) => {
+    const q = e.target.closest('[data-q]');
+    if (q) { state.qid = Number(q.dataset.q); state.pass = 0; setPlaying(false); return selectTrace(); }
+    const md = e.target.closest('[data-mode]');
+    if (md) { state.mode = md.dataset.mode; state.pass = 0; setPlaying(false); return selectTrace(); }
+    const g = e.target.closest('[data-g]');
+    if (g) {
+      state.group = Number(g.dataset.g);
+      $('layer-seg').querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === g)));
+      return render();
+    }
+    const row = e.target.closest('[data-row]');
+    if (row && Number(row.dataset.row) >= 0) { state.row = Number(row.dataset.row); render(); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('.dist[data-row]')) {
+      e.preventDefault(); e.stopPropagation(); state.row = Number(e.target.dataset.row); render();
+    }
+  }, true);
+  window.addEventListener('resize', drawStrip);
+  if (window.matchMedia) matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', drawStrip);
+  new MutationObserver(drawStrip).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  selectTrace();
+})();
+</script>
