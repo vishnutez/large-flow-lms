@@ -76,7 +76,8 @@ class ARModelWrapper(BaseModelWrapper):
 
         return output_ids, {
             "gen_len": gen_len,
-            "hit_eos": eos_id is not None and eos_id in generated,
+            "hit_eos": any(t in (eos_id if isinstance(eos_id, list) else [eos_id])
+                           for t in generated),
             "tokens_per_step": 1.0,
             "total_steps": gen_len,
         }

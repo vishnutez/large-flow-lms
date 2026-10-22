@@ -421,6 +421,7 @@ class AR2FlowEvalHarness(LM):
         self_cond=None,  # gen_mode=flow: None keeps the checkpoint setting; false drops the extra forward
         gen_batch_size=1,
         show_samples="true",
+        stop_at_im_end="true",  # also stop decoding at <|im_end|> (8B config EOS is <|endoftext|>)
         force_block_size=0,
         time_warp_per_position=None,  # None=inherit config; false=pooled grid
         noise_scale_override=None,  # None=inherit fcfg noise; set=tune noise HP
@@ -505,6 +506,16 @@ class AR2FlowEvalHarness(LM):
             )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        # Outputs are cut at <|im_end|> before scoring, so stopping there only
+        # skips wasted forwards. Pass stop_at_im_end=false to decode to the
+        # token budget as the paper's tokens-per-forward numbers do.
+        im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if _str2bool(stop_at_im_end) and isinstance(im_end, int) and im_end >= 0:
+            cfg = self.model.backbone.config
+            eos = cfg.eos_token_id
+            eos = [] if eos is None else [eos] if isinstance(eos, int) else list(eos)
+            if im_end not in eos:
+                cfg.eos_token_id = eos + [im_end]
 
         self.block_size = model.bd_size
         self.num_steps = num_steps

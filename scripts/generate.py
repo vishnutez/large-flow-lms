@@ -28,6 +28,8 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.0)
     parser.add_argument('--self-cond', type=_str2bool, help='Default keeps the checkpoint setting')
     parser.add_argument('--max-new-tokens', type=int, default=512)
+    parser.add_argument('--stop-at-im-end', type=_str2bool, default=True,
+                        help='Also stop at <|im_end|> (the 8B config EOS is <|endoftext|>)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output', help='Optional JSONL output path')
     args = parser.parse_args()
@@ -43,12 +45,15 @@ def main():
         parser.error('Pass --prompt or --prompt-file')
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from src.lafa.modeling_lafa import LafaForCausalLM
 
     load = dict(trust_remote_code=True, revision=args.revision, subfolder=args.subfolder)
     tokenizer = AutoTokenizer.from_pretrained(args.model, **load)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, **load).to('cuda').eval()
+    # The repo's model code, not the Hub copy, so list-valued EOS ids work.
+    model = LafaForCausalLM.from_pretrained(
+        args.model, dtype=torch.bfloat16, revision=args.revision,
+        subfolder=args.subfolder).to('cuda').eval()
 
     gen_kwargs = dict(gen_mode=args.gen_mode, max_new_tokens=args.max_new_tokens,
                       noise_scale_override=args.noise_scale_override, seed=args.seed,
@@ -59,6 +64,12 @@ def main():
             gen_kwargs['threshold'] = args.threshold
     if args.self_cond is not None:
         gen_kwargs['self_cond'] = args.self_cond
+    eos = model.generation_config.eos_token_id
+    eos = [] if eos is None else [eos] if isinstance(eos, int) else list(eos)
+    im_end = tokenizer.convert_tokens_to_ids('<|im_end|>')
+    if args.stop_at_im_end and isinstance(im_end, int) and im_end not in eos:
+        eos.append(im_end)
+    gen_kwargs['eos_token_id'] = eos
 
     out = None
     if args.output:

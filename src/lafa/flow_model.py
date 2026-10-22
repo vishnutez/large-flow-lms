@@ -17,6 +17,23 @@ from .layers import TimestepEmbedder, DiTAdaLN
 from .loss import cross_entropy_loss
 
 
+def _stop_ids(eos_token_id):
+    """Normalize a config eos_token_id (int, list, or None) to a set."""
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, int):
+        return {eos_token_id}
+    return {int(t) for t in eos_token_id}
+
+
+def _cut_at_stop(tokens, stop_ids):
+    """Truncate after the first stop token; return (tokens, hit_stop)."""
+    for i, tok in enumerate(tokens):
+        if tok in stop_ids:
+            return tokens[: i + 1], True
+    return tokens, False
+
+
 class FlowModelWrapper(BaseModelWrapper):
     """Wrap a causal LM for block flow training and decoding."""
 
@@ -1389,7 +1406,7 @@ class FlowModelWrapper(BaseModelWrapper):
         if prompt_ids.dim() == 1:
             prompt_ids = prompt_ids.unsqueeze(0)
         prompt_ids = prompt_ids.to(device)
-        eos_id = self.backbone.config.eos_token_id
+        eos_ids = _stop_ids(self.backbone.config.eos_token_id)
 
         orig_attn = getattr(self.backbone.config, "_attn_implementation", None)
         self.backbone.config._attn_implementation = "eager"
@@ -1414,7 +1431,7 @@ class FlowModelWrapper(BaseModelWrapper):
                     tok = int(prev_logit.argmax().item())
                 gen_ids.append(tok)
                 n += 1
-                if tok == eos_id or n >= max_new_tokens:
+                if tok in eos_ids or n >= max_new_tokens:
                     break
                 emb = self.embed_tokens(torch.tensor([[tok]], device=device))
                 t1 = self._compute_t_bn(torch.ones(1, 1, device=device, dtype=dtype))
@@ -1457,7 +1474,7 @@ class FlowModelWrapper(BaseModelWrapper):
         prompt_ids = prompt_ids.to(device)
         attention_mask = attention_mask.to(device)
         B, L = prompt_ids.shape
-        eos_id = self.backbone.config.eos_token_id
+        eos_ids = _stop_ids(self.backbone.config.eos_token_id)
         NEG = torch.finfo(dtype).min
 
         orig_attn = getattr(self.backbone.config, "_attn_implementation", None)
@@ -1491,7 +1508,7 @@ class FlowModelWrapper(BaseModelWrapper):
                     if finished[b]:
                         continue
                     gen_tokens[b].append(tok_l[b])
-                    if eos_id is not None and tok_l[b] == eos_id:
+                    if tok_l[b] in eos_ids:
                         finished[b] = True
                 n += 1
                 if n >= max_new_tokens or bool(finished.all()):
@@ -1623,7 +1640,7 @@ class FlowModelWrapper(BaseModelWrapper):
             prompt_ids = prompt_ids.unsqueeze(0)
         prompt_ids = prompt_ids.to(device)
         prompt_len = prompt_ids.shape[1]
-        eos_id = self.backbone.config.eos_token_id
+        eos_ids = _stop_ids(self.backbone.config.eos_token_id)
 
         time_grid = self._get_generation_time_grid(
             num_steps, device, grid_mode=grid_mode, t_max=t_max
@@ -1731,14 +1748,11 @@ class FlowModelWrapper(BaseModelWrapper):
                     else:
                         new_tokens = preds
 
-                if eos_id is not None and eos_id in new_tokens:
-                    new_tokens = new_tokens[: new_tokens.index(eos_id) + 1]
+                new_tokens, hit_eos = _cut_at_stop(new_tokens, eos_ids)
 
                 gen_ids.extend(new_tokens)
                 tokens_generated += len(new_tokens)
-                if tokens_generated >= max_new_tokens or (
-                    eos_id is not None and eos_id in new_tokens
-                ):
+                if tokens_generated >= max_new_tokens or hit_eos:
                     break
 
                 block_ids = torch.tensor([new_tokens], device=device)
@@ -1775,7 +1789,7 @@ class FlowModelWrapper(BaseModelWrapper):
             "total_steps": total_forward,
             "logical_steps": total_logical,
             "gen_len": len(generated),
-            "hit_eos": eos_id is not None and eos_id in generated,
+            "hit_eos": any(t in eos_ids for t in generated),
             "tokens_per_step": tokens_generated / max(total_forward, 1),
             "logical_tokens_per_step": tokens_generated / max(total_logical, 1),
             "block_size": self.bd_size,
@@ -1827,7 +1841,7 @@ class FlowModelWrapper(BaseModelWrapper):
             prompt_ids = prompt_ids.unsqueeze(0)
         prompt_ids = prompt_ids.to(device)
         prompt_len = prompt_ids.shape[1]
-        eos_id = self.backbone.config.eos_token_id
+        eos_ids = _stop_ids(self.backbone.config.eos_token_id)
         N = self.bd_size
         d = self._d_model
         E = self.embed_tokens.weight
@@ -2092,8 +2106,8 @@ class FlowModelWrapper(BaseModelWrapper):
                     win = [draft_idx[j - 1] + 1 + k for k in range(N)]
                     D = logf[win].argmax(-1).tolist()
 
-                if eos_id is not None and eos_id in new_tokens:
-                    new_tokens = new_tokens[: new_tokens.index(eos_id) + 1]
+                new_tokens, hit_eos = _cut_at_stop(new_tokens, eos_ids)
+                if hit_eos:
                     gen_ids.extend(new_tokens)
                     committed += len(new_tokens)
                     break
@@ -2113,7 +2127,7 @@ class FlowModelWrapper(BaseModelWrapper):
             "total_steps": total_fwd,
             "logical_steps": total_fwd,
             "gen_len": len(generated),
-            "hit_eos": eos_id is not None and eos_id in generated,
+            "hit_eos": any(t in eos_ids for t in generated),
             "tokens_per_step": apf,
             "logical_tokens_per_step": apf,
             "accepted_per_forward": apf,
@@ -2158,7 +2172,7 @@ class FlowModelWrapper(BaseModelWrapper):
         attention_mask = attention_mask.to(device)
         B, L = prompt_ids.shape
         bd = self.bd_size
-        eos_id = self.backbone.config.eos_token_id
+        eos_ids = _stop_ids(self.backbone.config.eos_token_id)
         NEG = torch.finfo(dtype).min
         time_grid = self._get_generation_time_grid(
             num_steps, device, grid_mode=grid_mode, t_max=t_max
@@ -2460,8 +2474,8 @@ class FlowModelWrapper(BaseModelWrapper):
                     if finished[b]:
                         continue
                     toks = pred_l[b]
-                    if eos_id is not None and eos_id in toks:
-                        toks = toks[: toks.index(eos_id) + 1]
+                    toks, hit_eos = _cut_at_stop(toks, eos_ids)
+                    if hit_eos:
                         finished[b] = True
                     gen_tokens[b].extend(toks)
                 tokens_generated += bd
