@@ -1,0 +1,42 @@
+# gsm8k_cot on the train split, for tuning decoding settings without touching
+# test questions. Prompt, stop strings, filters and metric match lm-eval's
+# gsm8k_cot (v3.0). Use with --include_path src/evaluation/tasks.
+task: gsm8k_cot_train
+dataset_path: openai/gsm8k
+dataset_name: main
+test_split: train
+output_type: generate_until
+doc_to_text: "Q: {{question}}\nA:"
+doc_to_target: "{{answer.split('####')[-1].strip()}}"
+num_fewshot: 0
+generation_kwargs:
+  do_sample: false
+  until:
+    - "Q:"
+    - "</s>"
+    - "<|im_end|>"
+filter_list:
+  - name: strict-match
+    filter:
+      - function: regex
+        regex_pattern: "The answer is (\\-?[0-9\\.\\,]+)."
+      - function: take_first
+  - name: flexible-extract
+    filter:
+      - function: regex
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: take_first
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+metadata:
+  version: 1.0

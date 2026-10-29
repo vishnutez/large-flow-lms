@@ -144,7 +144,22 @@ def _build_model(
             from src.lafa.modeling_lafa import LafaForCausalLM
             model = LafaForCausalLM.from_pretrained(pretrained, dtype=dtype).to(device).eval()
             if force_block_size and int(force_block_size) != model.bd_size:
-                raise ValueError('HF checkpoints require their saved block size for inference')
+                # Cross-block-size transfer eval: no weights depend on the block
+                # size, but the per-position time schedules do. Stretch the trained
+                # schedules over the new block so slot j uses trained position
+                # j * B_trained // B_new, keeping the left-to-right ordering.
+                new_size = int(force_block_size)
+                if is_main:
+                    print(f"[ar2flow] force_block_size={new_size} overrides trained "
+                          f"bd_size={model.bd_size} (cross-block-size transfer eval)")
+                state = model.time_warper.state_dict()
+                loss_ema = state["loss_ema"]
+                if loss_ema.ndim == 2:
+                    rows = torch.arange(new_size) * loss_ema.shape[0] // new_size
+                    state = {**state, "loss_ema": loss_ema[rows]}
+                model.bd_size = new_size
+                model.time_warper = None
+                model._ensure_time_warper(device).load_state_dict(state)
             if noise_scale_override is not None:
                 model.noise_scale_mult = float(noise_scale_override)
             if time_warp_per_position_override is not None:
