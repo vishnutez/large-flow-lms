@@ -67,12 +67,6 @@ def parse_args():
     p.add_argument('--tilt-kappa', type=float, default=1.0,
                    help='tilt: link F(s) = sigmoid(kappa s)^(1/kappa); 1 = sigmoid, large = '
                         "v2's pair inside the feasible region (a smooth dual clip)")
-    p.add_argument('--tilt-link', default='kappa', choices=['kappa', 'cloglog'],
-                   help="tilt: link F; kappa = sigmoid(kappa s)^(1/kappa), cloglog = "
-                        "1 - exp(-e^s) (a negative's token gets v2's push r q, no ceiling)")
-    p.add_argument('--tilt-neg-clip', type=float, default=0.0,
-                   help="tilt: no token/AR gradient for a negative's token with p/p_old above "
-                        "this (v2's dual clip; 0: off)")
     p.add_argument('--eps', type=float, default=1.0, help='negative ratio clip (NFT)')
     # Defaults below depend on --loss: v1/v2 = all three terms, nft weighting,
     # per-token averaging, plain MSE; dn = embedding term only, soft r,
@@ -332,8 +326,7 @@ def main():
             terms_fn={'v1': nft_terms, 'v2': nft_terms_v2, 'dn': dn_terms,
                       'ppo-lafa': ppo_lafa_terms,
                       'tilt': functools.partial(tilt_terms, b_mode=args.tilt_b,
-                                                kappa=args.tilt_kappa, link=args.tilt_link,
-                                                neg_clip=args.tilt_neg_clip)}[args.loss],
+                                                kappa=args.tilt_kappa)}[args.loss],
             weighting=args.weighting, adv_clip=args.adv_clip, normalize=args.normalize,
             adaptive_weight=bool(args.adaptive_weight), token_weight=args.token_weight,
             keep_uniform=bool(args.keep_uniform), mix=args.mix,
