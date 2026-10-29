@@ -21,6 +21,8 @@ results/
 temp/
 trash/
 wandb/
+related_work/
+our_work/
 
 *.safetensors
 *.pt

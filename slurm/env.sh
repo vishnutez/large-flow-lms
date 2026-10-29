@@ -22,6 +22,9 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 # Model and dataset caches on scratch; the released Lafa checkpoints live here.
 export HF_HOME="${HF_HOME:-/scratch/user/$USER/.cache/huggingface}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/scratch/user/$USER/.cache/triton}"
+# DeepSpeed (imported by transformers' save_pretrained via accelerate) refuses
+# to load without a CUDA toolkit; use the cluster's module matching torch cu128.
+export CUDA_HOME="${CUDA_HOME:-/sw/eb/sw/CUDA/12.8.0}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
