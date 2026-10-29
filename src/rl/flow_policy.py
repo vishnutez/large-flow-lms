@@ -188,6 +188,45 @@ def rollout(model, prompt_ids, *, max_new_tokens, num_steps, sde_gamma, seed):
         blocks=blocks, sigma=sigma, num_forwards=num_forwards)
 
 
+@torch.no_grad()
+def batched_rollouts(model, prompts, *, max_new_tokens, num_steps, seed, batch_size):
+    """ODE answers to ``prompts`` (1-D id tensors, repeats allowed), decoded
+    ``batch_size`` at a time with ``model.generate_batched``.
+
+    Each row gets its own initial noise, so repeated prompts give distinct
+    answers. Unlike ``rollout`` nothing is recorded (``blocks`` is empty): use
+    it where only the response is needed (NFT). Outputs differ from
+    ``rollout``'s like a different seed.
+    """
+    _check_supported(model)
+    out = []
+    for c, s in enumerate(range(0, len(prompts), batch_size)):
+        chunk = [p.reshape(-1) for p in prompts[s:s + batch_size]]
+        width = max(p.numel() for p in chunk)
+        ids = torch.zeros(len(chunk), width, dtype=torch.long)
+        mask = torch.zeros(len(chunk), width, dtype=torch.long)
+        for j, p in enumerate(chunk):  # left padding
+            ids[j, width - p.numel():] = p
+            mask[j, width - p.numel():] = 1
+        seqs, _ = model.generate_batched(
+            ids, mask, max_new_tokens=max_new_tokens, num_steps=num_steps,
+            seed=seed * 1_000_003 + c, grid_mode="warp", cfg_scale=1.0,
+            independent_noise=True)
+        per_block = num_steps + int(model.enable_self_cond)
+        for p, seq in zip(chunk, seqs):
+            response = torch.tensor(seq[p.numel():], dtype=torch.long)
+            out.append(Rollout(
+                prompt_ids=p.cpu(), response_ids=response, blocks=[],
+                sigma=model._noise_sigma * model.noise_scale_mult,
+                num_forwards=-(-response.numel() // model.bd_size) * per_block))
+    # generate_batched seeds the global RNG and its noise generator with the
+    # same seed, so the caller's next draws (NFT's forward-process noise)
+    # would replay the rollouts' initial noise. Move the global RNG to a seed
+    # no chunk used.
+    torch.manual_seed(seed * 1_000_003 + c + 1)
+    return out
+
+
 def packed_attention_mask(seq_len, groups, dtype, device):
     """Additive mask for [clean (seq_len) | groups], each group (start, size).
 

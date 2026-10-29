@@ -129,7 +129,8 @@ def test_ema_update_and_sync():
     assert not any(p.requires_grad for p in old.parameters())
 
 
-def test_nft_step_trains_policy_and_moves_old(monkeypatch):
+@pytest.mark.parametrize('rollout_batch', [0, 4])
+def test_nft_step_trains_policy_and_moves_old(monkeypatch, rollout_batch):
     from src.rl.grpo import MasterAdamW
 
     class Tok:
@@ -146,7 +147,8 @@ def test_nft_step_trains_policy_and_moves_old(monkeypatch):
     rewards = itertools.cycle([1.0, 0.0, 0.0])
     q = dict(prompt_ids=torch.tensor([2, 3, 4, 5, 6]), answer='')
     sums = nft_step(model, old, ema, opt, Tok(), [q], group_size=6, num_steps=3,
-                    max_new_tokens=12, minibatches=2, beta=1.0, eps=1.0, embed_weight=1.0,
+                    max_new_tokens=12, minibatches=2, rollout_batch=rollout_batch, beta=1.0,
+                    eps=1.0, embed_weight=1.0,
                     ar_weight=1.0, noise_scale=4.0, self_cond_prob=0.5, max_grad_norm=1.0,
                     eta=0.5, seed=1, reward_fn=lambda r, a: next(rewards),
                     truncated_negative=False)
@@ -154,6 +156,40 @@ def test_nft_step_trains_policy_and_moves_old(monkeypatch):
     assert sums['n_flow'] > 0 and sums['n_ar'] > 0
     assert any(not torch.equal(b, p) for b, p in zip(before, opt.params))
     assert any(not torch.equal(b, p) for b, p in zip(old_before, ema.old_params))
+
+
+def test_nft_step_updates_reuse_every_answer_per_pass():
+    """``updates`` = 3, one minibatch: 3 optimizer steps, each on all kept
+    answers (3x the tokens of a single pass)."""
+    from src.rl.grpo import MasterAdamW
+
+    class Tok:
+        pad_token_id = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            return ''
+
+    q = dict(prompt_ids=torch.tensor([2, 3, 4, 5, 6]), answer='')
+
+    def run(updates):
+        model, old = pair()
+        opt = MasterAdamW(model.parameters(), lr=1e-3)
+        ema = OldPolicyEMA(opt, model, old)
+        steps = []
+        step = opt.step
+        opt.step = lambda *a: steps.append(1) or step(*a)
+        rewards = itertools.cycle([1.0, 0.0, 0.0])
+        sums = nft_step(model, old, ema, opt, Tok(), [q], group_size=6, num_steps=3,
+                        max_new_tokens=12, minibatches=1, updates=updates, beta=1.0,
+                        eps=1.0, embed_weight=1.0, ar_weight=1.0, noise_scale=4.0,
+                        self_cond_prob=0.5, max_grad_norm=1.0, eta=0.5, seed=1,
+                        reward_fn=lambda r, a: next(rewards), truncated_negative=False)
+        return sums, len(steps)
+
+    one, n1 = run(1)
+    three, n3 = run(3)
+    assert (n1, n3) == (1, 3) and one['kept'] == three['kept'] == 6
+    assert three['n_flow'] == 3 * one['n_flow'] and three['n_ar'] == 3 * one['n_ar']
 
 
 @pytest.mark.parametrize('mix', ['prob', 'logit', 'geo'])

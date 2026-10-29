@@ -3,8 +3,8 @@
 Same launch, validation split, logging, checkpointing and resume as
 scripts/train_grpo.py. Each iteration: θ_old rolls out ``group_size`` ODE
 answers per question, groups with mixed correctness are kept, the policy takes
-``minibatches`` optimizer steps on Lafa's training loss with the NFT contrast,
-and θ_old moves toward θ by EMA.
+``updates`` × ``minibatches`` optimizer steps on Lafa's training loss with the
+NFT contrast (``updates`` passes over the answers), and θ_old moves toward θ by EMA.
 
     RL_SCRIPT=scripts/train_nft.py sbatch slurm/grpo-flex.sbatch --model lafa-hf/lafa-7B \\
         --run-name nft-7b-k2
@@ -27,12 +27,14 @@ from transformers import AutoTokenizer
 
 from src.lafa.modeling_lafa import LafaForCausalLM
 from src.rl.grpo import MasterAdamW, evaluate, gsm8k_reward
+from src.rl.lora import ADAPTER_CONFIG, add_lora, save_adapters
 from src.rl.nft import OldPolicyEMA, eta_schedule, nft_step, nft_terms
 from src.rl.nft_dn import dn_terms
 from src.rl.nft_v2 import nft_terms_v2
 from src.rl.ppo_lafa import ppo_lafa_terms
 from src.rl.tilt import tilt_terms
-from train_grpo import init_wandb, other_live_job, reduce_sums, slurm_job_end, slurm_to_torch_env
+from train_grpo import (init_wandb, other_live_job, reduce_sums, slurm_job_end, slurm_to_torch_env,
+                        wandb_row)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,7 +52,14 @@ def parse_args():
     p.add_argument('--forward-noise-scale', type=float, default=4.0,
                    help="noise scale of the update's forward process (Lafa trains at 4.0)")
     p.add_argument('--max-new-tokens', type=int, default=512)
-    p.add_argument('--minibatches', type=int, default=4, help='optimizer steps per iteration')
+    p.add_argument('--minibatches', type=int, default=4,
+                   help='optimizer steps per pass over the rollouts')
+    p.add_argument('--rollout-batch', type=int, default=0,
+                   help='decode each rank\'s answers this many at a time (0: one at a time, '
+                        'the earlier runs\' random stream)')
+    p.add_argument('--updates', type=int, default=1,
+                   help='passes over the rollouts per iteration (PPO epochs; 1 = each '
+                        'answer trains once)')
     p.add_argument('--loss', default='v1', choices=['v1', 'v2', 'dn', 'ppo-lafa', 'tilt'],
                    help='v1: fixed beta in both denoiser branches (run nft-7b-k2); '
                         'v2: negative branch beta = r/(1-r), group-relative (nft_v2.py); '
@@ -109,6 +118,10 @@ def parse_args():
     p.add_argument('--export-at-val', type=int, default=1,
                    help='also save the policy as a bf16 HF model at every Nth validation '
                         'step (output/rl/<run>/step-NNNN, ~15 GB for 7B); 0 = never')
+    p.add_argument('--lora-rank', type=int, default=0,
+                   help='LoRA rank on the backbone linear layers (q,k,v,o,gate,up,down); '
+                        'everything else frozen. 0: full fine-tuning')
+    p.add_argument('--lora-alpha', type=float, default=None, help='LoRA alpha (default 2 x rank)')
     p.add_argument('--stop-margin-min', type=float, default=15)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--wandb-project', default='lafa-rl', help="'' disables W&B logging")
@@ -132,7 +145,14 @@ def parse_args():
     if dn and args.ar_weight and args.beta != 1.0:
         p.error('dn: the AR positive branch is the beta = 1 mixture; use --beta 1 or --ar-weight 0')
     args.sde_gamma = 0.0  # rollouts and the SDE validation column use the ODE
+    if args.lora_rank and args.lora_alpha is None:
+        args.lora_alpha = 2.0 * args.lora_rank
     return args
+
+
+def exported(path):
+    """A model export (full model, or LoRA adapters) exists at ``path``."""
+    return any(os.path.exists(f'{path}/{name}') for name in ('config.json', ADAPTER_CONFIG))
 
 
 def main():
@@ -153,7 +173,7 @@ def main():
     out_dir = f'output/rl/{args.run_name}'
     ckpt_dir = f'{out_dir}/checkpoint'
 
-    if (os.path.exists(f'{out_dir}/final/config.json')
+    if (exported(f'{out_dir}/final')
             and not os.path.exists(f'{ckpt_dir}/state.json')):
         # Finished, and its optimizer checkpoint was deleted: a chained
         # follow-up job must not start the run over.
@@ -217,7 +237,12 @@ def main():
         eos = m.backbone.config.eos_token_id
         eos = [eos] if isinstance(eos, int) else list(eos or [])
         m.backbone.config.eos_token_id = eos + [im_end] * (im_end not in eos)
-    if not args.train_embeddings:
+    if args.lora_rank:
+        # Same seed for both, so θ_old starts with the policy's A (B = 0).
+        for m in (model, old_model):
+            torch.manual_seed(args.seed)
+            add_lora(m, args.lora_rank, args.lora_alpha)
+    elif not args.train_embeddings:
         model.embed_tokens.weight.requires_grad_(False)
         model.lm_head.weight.requires_grad_(False)
     optimizer = MasterAdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -262,8 +287,7 @@ def main():
         log.write(json.dumps(row) + '\n')
         log.flush()
         if wb:
-            wb.log({'step': row['step'], **{f"{row['kind']}/{k}": v for k, v in row.items()
-                                           if k not in ('kind', 'step')}})
+            wb.log(wandb_row(row, row['step'] * per_step / len(train_ids)))
 
     def run_eval(step):
         # Validation decodes with θ (ODE). The SDE column of GRPO runs is not
@@ -277,11 +301,19 @@ def main():
         if args.export_at_val and step > 0 and (step // args.val_every) % args.export_at_val == 0:
             if rank == 0:
                 path = f'{out_dir}/step-{step:04d}'
-                model.save_pretrained(path)
+                save_model(path)
                 tokenizer.save_pretrained(path)
                 print(f'[nft] exported {path}', flush=True)
             if distributed:
                 dist.barrier()
+
+    def save_model(path):
+        # LoRA: only the adapters (scripts/lora_merge.py builds the full model).
+        if args.lora_rank:
+            save_adapters(model, path, base_model=args.model, rank=args.lora_rank,
+                          alpha=args.lora_alpha)
+        else:
+            model.save_pretrained(path)
 
     def save(step):
         tmp = f'{ckpt_dir}.tmp'
@@ -318,7 +350,9 @@ def main():
         sums = nft_step(
             model, old_model, ema, optimizer, tokenizer, [encode(i) for i in qids],
             group_size=args.group_size, num_steps=args.num_steps,
-            max_new_tokens=args.max_new_tokens, minibatches=args.minibatches, beta=args.beta,
+            max_new_tokens=args.max_new_tokens, minibatches=args.minibatches,
+            updates=args.updates,
+            rollout_batch=args.rollout_batch, beta=args.beta,
             eps=args.eps, embed_weight=args.embed_weight, ar_weight=args.ar_weight,
             noise_scale=args.forward_noise_scale, self_cond_prob=args.self_cond_prob,
             max_grad_norm=args.max_grad_norm, eta=eta_schedule(step, args.eta_rate, args.eta_max),
@@ -364,11 +398,11 @@ def main():
     if rank == 0:
         if step == args.train_steps:
             last = f'step-{step:04d}'
-            if os.path.exists(f'{out_dir}/{last}/config.json'):
+            if exported(f'{out_dir}/{last}'):
                 if not os.path.lexists(f'{out_dir}/final'):
                     os.symlink(last, f'{out_dir}/final')
             else:
-                model.save_pretrained(f'{out_dir}/final')
+                save_model(f'{out_dir}/final')
                 tokenizer.save_pretrained(f'{out_dir}/final')
             print(f'[nft] final model at {out_dir}/final', flush=True)
         os.remove(f'{out_dir}/RUNNING')

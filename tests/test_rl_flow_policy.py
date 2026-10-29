@@ -44,6 +44,42 @@ def test_rollout_matches_generate(self_cond):
     assert sum(len(b.tokens) for b in ro.blocks) == 10
 
 
+@pytest.mark.parametrize('self_cond', [False, True])
+def test_batched_rollouts_are_distinct_and_match_generate_batched(self_cond):
+    from src.rl.flow_policy import batched_rollouts
+    model = tiny_model(self_cond)
+    model.noise_scale_mult = 100.0  # at 0.1 the tiny model's answers ignore the noise
+    prompts = [torch.tensor([2, 3, 4])] * 4 + [torch.tensor([5, 6, 7, 8, 9])] * 3
+    ros = batched_rollouts(model, prompts, max_new_tokens=10, num_steps=3, seed=7,
+                           batch_size=4)
+    assert [torch.equal(r.prompt_ids, p) for r, p in zip(ros, prompts)] == [True] * 7
+    # each row has its own initial noise: repeats of a prompt differ (with
+    # shared noise all 4 are identical)
+    assert len({tuple(r.response_ids.tolist()) for r in ros[:4]}) == 4
+    per_block = 3 + int(self_cond)
+    for r in ros:
+        assert 0 < r.response_ids.numel() <= 10
+        assert r.num_forwards == -(-r.response_ids.numel() // 4) * per_block
+    # the second chunk (3 rows, seed 7 * 1_000_003 + 1) is generate_batched's output
+    ids = torch.tensor([[5, 6, 7, 8, 9]] * 3)
+    seqs, _ = model.generate_batched(ids, torch.ones_like(ids), max_new_tokens=10,
+                                     num_steps=3, seed=7 * 1_000_003 + 1, grid_mode='warp',
+                                     independent_noise=True)
+    assert [r.response_ids.tolist() for r in ros[4:]] == [s[5:] for s in seqs]
+
+
+def test_batched_rollouts_do_not_replay_their_noise():
+    """The caller's next random draws (NFT's forward-process noise) must not
+    repeat the noise the rollouts were decoded from."""
+    from src.rl.flow_policy import batched_rollouts
+    model = tiny_model(False)
+    batched_rollouts(model, [torch.tensor([2, 3, 4])] * 4, max_new_tokens=8, num_steps=3,
+                     seed=5, batch_size=4)
+    after = torch.randn(4 * 4 * 16)
+    first = torch.randn(4, 4, 16, generator=torch.Generator().manual_seed(5 * 1_000_003))
+    assert not torch.equal(after, first.flatten())
+
+
 def test_packed_attention_mask():
     mask = packed_attention_mask(5, [(2, 2), (4, 2)], torch.float32, 'cpu') == 0
     assert mask[:5, :5].equal(torch.tril(torch.ones(5, 5, dtype=torch.bool)))

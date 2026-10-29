@@ -287,12 +287,14 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
              self_cond_prob, max_grad_norm, eta, seed, reward_fn, truncated_negative=True,
              terms_fn=None, weighting="nft", adv_clip=5.0, normalize="token",
              adaptive_weight=False, token_weight=1.0, keep_uniform=False, mix="prob",
-             ppo_clip=0.0, dual_clip=0.0):
+             ppo_clip=0.0, dual_clip=0.0, updates=1, rollout_batch=0):
     """One Lafa-NFT iteration on this rank's ``questions``.
 
     1. Roll out ``group_size`` answers per question with θ_old and the ODE
        sampler (sde_gamma=0; seeds differ, so initial noise differs).
-       Truncated answers count as negatives.
+       Truncated answers count as negatives. ``rollout_batch`` > 0 decodes
+       the rank's answers that many at a time (``batched_rollouts``; a
+       different random stream than the default one-at-a-time ``rollout``).
     2. Weight the answers (``weighting``):
        - ``"nft"`` (v1, v2): each answer trains one branch (positive if
          correct) with weight ω = 1 - r̂.
@@ -305,7 +307,9 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
          ``adv_clip``/β (DiffusionNFT's ``ori_policy_loss * adv_clip_max``).
        Only groups with 0 < r̂ < 1 are kept unless ``keep_uniform`` (dn only;
        DiffusionNFT keeps them, with r = 0.5 they only anchor θ to θ_old).
-    3. ``minibatches`` optimizer steps over the kept answers. ``normalize``
+    3. ``updates`` passes over the kept answers, each reshuffled and split
+       into ``minibatches`` optimizer steps (``updates`` × ``minibatches``
+       steps; passes after the first are off-policy, as in PPO). ``normalize``
        ``"token"`` averages each term over the tokens of the minibatch on all
        ranks; ``"answer"`` averages each answer's terms over its own tokens,
        then over the minibatch's answers on all ranks (DiffusionNFT).
@@ -321,7 +325,7 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
     Every rank takes the same number of optimizer steps (collectives match).
     Returns sums over this rank (``count`` = rollouts) for logging.
     """
-    from src.rl.flow_policy import rollout
+    from src.rl.flow_policy import batched_rollouts, rollout
 
     if weighting not in ("nft", "dn", "adv") or normalize not in ("token", "answer"):
         raise ValueError(f"unknown weighting {weighting!r} or normalize {normalize!r}")
@@ -333,11 +337,19 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
                 update_s=0.0, grad_norm=0.0, skipped_answers=0, skipped_steps=0)
     start = time.perf_counter()
     groups = []
+    if rollout_batch > 0:
+        flat = batched_rollouts(old_model, [q["prompt_ids"] for q in questions
+                                            for _ in range(group_size)],
+                                max_new_tokens=max_new_tokens, num_steps=num_steps,
+                                seed=seed, batch_size=rollout_batch)
     for qi, q in enumerate(questions):
-        group = [rollout(old_model, q["prompt_ids"], max_new_tokens=max_new_tokens,
-                         num_steps=num_steps, sde_gamma=0.0,
-                         seed=seed * 1_000_003 + qi * group_size + g)
-                 for g in range(group_size)]
+        if rollout_batch > 0:
+            group = flat[qi * group_size:(qi + 1) * group_size]
+        else:
+            group = [rollout(old_model, q["prompt_ids"], max_new_tokens=max_new_tokens,
+                             num_steps=num_steps, sde_gamma=0.0,
+                             seed=seed * 1_000_003 + qi * group_size + g)
+                     for g in range(group_size)]
         rewards = []
         for ro in group:
             truncated = truncated_negative and ro.response_ids.numel() >= max_new_tokens
@@ -379,7 +391,7 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
     sums["rollout_s"] = time.perf_counter() - start
 
     start = time.perf_counter()
-    order = torch.randperm(len(kept), generator=torch.Generator().manual_seed(seed)).tolist()
+    gen = torch.Generator().manual_seed(seed)
     world = dist.get_world_size() if dist.is_initialized() else 1
     extra = dict(adaptive=True) if adaptive_weight else {}
     if mix != "prob":
@@ -387,8 +399,10 @@ def nft_step(model, old_model, ema, optimizer, tokenizer, questions, *, group_si
     if ppo_clip > 0.0 or dual_clip > 0.0:
         extra.update(ppo_clip=ppo_clip, dual_clip=dual_clip)
     norms = []
-    for mb in range(minibatches):
-        batch = [kept[j] for j in order[mb::minibatches]]
+    for mb in range(updates * minibatches):
+        if mb % minibatches == 0:
+            order = torch.randperm(len(kept), generator=gen).tolist()
+        batch = [kept[j] for j in order[mb % minibatches::minibatches]]
         for item in batch:
             item["valid"] = model._full_block_loss_mask(item["labels"] != -100)
         counts = torch.tensor([sum(int(it["valid"].sum()) for it in batch),

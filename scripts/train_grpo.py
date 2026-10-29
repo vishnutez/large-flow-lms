@@ -112,9 +112,27 @@ def init_wandb(args, world):
                id=run_id, resume='allow', dir=out_dir,
                config=dict(vars(args), world_size=world,
                            slurm_job_id=os.environ.get('SLURM_JOB_ID')))
+    # Every row is plotted against the step; the reward and validation
+    # metrics are repeated under by_epoch/ against epochs of the training set.
+    # The patterns do not overlap.
     wandb.define_metric('step')
-    wandb.define_metric('*', step_metric='step')
+    wandb.define_metric('epoch')
+    for prefix in ('train', 'val'):
+        wandb.define_metric(f'{prefix}/*', step_metric='step')
+    wandb.define_metric('by_epoch/*', step_metric='epoch')
     return wandb
+
+
+def wandb_row(row, epoch):
+    """A log row as a W&B record (see ``init_wandb``)."""
+    out = {'step': row['step'], 'epoch': epoch}
+    for k, v in row.items():
+        if k in ('kind', 'step'):
+            continue
+        out[f"{row['kind']}/{k}"] = v
+        if row['kind'] == 'val' or k == 'reward':
+            out[f"by_epoch/{row['kind']}/{k}"] = v
+    return out
 
 
 def slurm_job_end():
@@ -288,8 +306,7 @@ def main():
             log.write(json.dumps(row) + '\n')
             log.flush()
             if wb:
-                wb.log({'step': row['step'], **{f"{row['kind']}/{k}": v for k, v in row.items()
-                                               if k not in ('kind', 'step')}})
+                wb.log(wandb_row(row, row['step'] * per_step / len(train_ids)))
         if args.export_at_val and step > 0 and (step // args.val_every) % args.export_at_val == 0:
             if rank == 0:
                 path = f'{out_dir}/step-{step:04d}'
@@ -360,8 +377,7 @@ def main():
             log.write(json.dumps(row) + '\n')
             log.flush()
             if wb:
-                wb.log({'step': row['step'], **{f"{row['kind']}/{k}": v for k, v in row.items()
-                                               if k not in ('kind', 'step')}})
+                wb.log(wandb_row(row, row['step'] * per_step / len(train_ids)))
         if step % args.val_every == 0 or step == args.train_steps:
             run_eval(step)
         # Stop before the time limit (decided on rank 0, shared with all ranks).

@@ -2158,11 +2158,14 @@ class FlowModelWrapper(BaseModelWrapper):
         sde_noiseless: bool = False,
         euler_alpha: float = 1.0,
         cfg_scale: float = 1.0,
+        independent_noise: bool = False,
     ):
         """Decode full blocks for left-padded prompts with a masked KV cache.
 
         Shared initial noise makes deterministic decoding nearly batch invariant.
         SDE churn uses independent noise for each batch row.
+        ``independent_noise`` draws each row's initial block noise separately
+        too (RL: distinct samples for repeated prompts under the ODE sampler).
         """
         device = next(self.backbone.parameters()).device
         dtype = self.embed_tokens.weight.dtype
@@ -2191,11 +2194,12 @@ class FlowModelWrapper(BaseModelWrapper):
         E = self.embed_tokens.weight
 
         def shared_noise():
-            """One standalone-equivalent RNG draw, broadcast across batch rows."""
+            """One standalone-equivalent RNG draw, broadcast across batch rows
+            (one draw per row with ``independent_noise``)."""
             return (
                 (
                     torch.randn(
-                        1,
+                        B if independent_noise else 1,
                         bd,
                         self._d_model,
                         generator=noise_gen,
