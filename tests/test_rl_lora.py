@@ -3,8 +3,8 @@ import itertools
 import torch
 
 from src.lafa.modeling_lafa import LafaForCausalLM
-from src.rl.lora import (TARGETS, LoRALinear, add_lora, load_adapters, merged_state_dict,
-                         save_adapters)
+from src.rl.lora import (TARGETS, LoRALinear, add_lora, load_adapters, merge_lora,
+                         merged_state_dict, save_adapters, unmerge_lora)
 from tests.test_rl_flow_policy import tiny_model
 
 
@@ -130,3 +130,66 @@ def test_lora_merge_script_writes_the_merged_model(tmp_path, monkeypatch):
     # the adapters move these logits by ~0.3
     torch.testing.assert_close(clean_logits(merged, ids), clean_logits(model, ids),
                                atol=1e-5, rtol=1e-4)
+
+
+def unmerged_logits(model, ids):
+    saved = {m: m.lora_merged for m in model.modules() if isinstance(m, LoRALinear)}
+    for m in saved:
+        m.lora_merged = None
+    out = clean_logits(model, ids)
+    for m, w in saved.items():
+        m.lora_merged = w
+    return out
+
+
+def test_merged_forward_matches_the_adapter_forward_and_refreshes():
+    model = tiny_model(True)
+    add_lora(model, rank=4, alpha=8)
+    layers = [m for m in model.modules() if isinstance(m, LoRALinear)]
+    ids = torch.tensor([[2, 3, 4, 5, 6, 7]])
+    with torch.no_grad():
+        for m in layers:
+            m.lora_B.normal_(std=5.0)
+    merge_lora(model)
+    base_w = [m.weight.clone() for m in layers]
+    torch.testing.assert_close(clean_logits(model, ids), unmerged_logits(model, ids),
+                               atol=1e-5, rtol=1e-4)
+    with torch.no_grad():  # new adapters: the merged weights follow on the next merge
+        for m in layers:
+            m.lora_B.normal_(std=5.0)
+    stale = clean_logits(model, ids)
+    merge_lora(model)
+    assert not torch.allclose(stale, clean_logits(model, ids), atol=1e-3)
+    torch.testing.assert_close(clean_logits(model, ids), unmerged_logits(model, ids),
+                               atol=1e-5, rtol=1e-4)
+    assert all(torch.equal(m.weight, w) for m, w in zip(layers, base_w))  # W untouched
+    merged = clean_logits(model, ids)
+    unmerge_lora(model)
+    assert all(m.lora_merged is None for m in layers)
+    out = clean_logits(model, ids)
+    torch.testing.assert_close(out, merged, atol=1e-5, rtol=1e-4)
+    out.sum().backward()  # the adapter forward again: gradients reach the adapters
+    assert all(m.lora_B.grad is not None for m in layers)
+
+
+def test_old_policy_ema_keeps_the_merged_old_model_in_sync():
+    from src.rl.grpo import MasterAdamW
+    from src.rl.nft import OldPolicyEMA
+
+    model, old = tiny_model(False), tiny_model(False)
+    for m in (model, old):
+        torch.manual_seed(0)
+        add_lora(m, rank=4, alpha=8)
+    opt = MasterAdamW(model.parameters(), lr=1e-2)
+    ema = OldPolicyEMA(opt, model, old)
+    assert all(m.lora_merged is not None for m in old.modules() if isinstance(m, LoRALinear))
+    assert all(m.lora_merged is None for m in model.modules() if isinstance(m, LoRALinear))
+    with torch.no_grad():
+        for i, master in opt.masters.items():
+            master.add_(torch.randn_like(master))
+    ema.update(0.0)  # θ_old ← θ (the masters)
+    ids = torch.tensor([[2, 3, 4, 5, 6, 7]])
+    torch.testing.assert_close(clean_logits(old, ids), unmerged_logits(old, ids),
+                               atol=1e-5, rtol=1e-4)
+    assert not torch.allclose(clean_logits(old, ids), clean_logits(tiny_model(False), ids),
+                              atol=1e-3)

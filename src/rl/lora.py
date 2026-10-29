@@ -22,9 +22,17 @@ TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down
 
 class LoRALinear(nn.Linear):
     """W x + b + (alpha / r) B A x, with W and b frozen. B starts at zero, so
-    the adapted layer starts equal to the base layer."""
+    the adapted layer starts equal to the base layer.
+
+    With ``lora_merged`` set (``merge_lora``), the forward uses that merged
+    weight in one matmul instead: for a no-grad model (θ_old) that decodes
+    with small batches, where the adapter's extra kernels dominate."""
+
+    lora_merged = None
 
     def forward(self, x):
+        if self.lora_merged is not None:
+            return F.linear(x, self.lora_merged, self.bias)
         out = F.linear(x, self.weight, self.bias)
         return out + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.lora_scaling
 
@@ -32,6 +40,32 @@ class LoRALinear(nn.Linear):
         """W + (alpha / r) B A, computed in float32, in W's dtype."""
         delta = self.lora_B.float() @ self.lora_A.float()
         return (self.weight.float() + self.lora_scaling * delta).to(self.weight.dtype)
+
+
+@torch.no_grad()
+def merge_lora(model):
+    """Set (or refresh) every LoRALinear's ``lora_merged`` = W + (alpha/r) B A
+    from its current adapters. W stays untouched, so repeated merges do not
+    accumulate rounding. Costs one extra copy of the adapted weights."""
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            w = m.merged_weight()
+            if m.lora_merged is None:
+                m.lora_merged = w
+            else:
+                m.lora_merged.copy_(w)
+
+
+def unmerge_lora(model):
+    """Back to the adapter forward (gradients reach A and B); frees the
+    merged weights."""
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.lora_merged = None
+
+
+def has_lora(model):
+    return any(isinstance(m, LoRALinear) for m in model.modules())
 
 
 def add_lora(model, rank, alpha, targets=TARGETS):

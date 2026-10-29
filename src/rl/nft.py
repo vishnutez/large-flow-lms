@@ -26,6 +26,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from src.rl.lora import has_lora, merge_lora
+
 
 def st_clamp_min(x: Tensor, floor) -> Tensor:
     """max(x, floor) in the forward pass, the gradient of x in the backward
@@ -240,15 +242,23 @@ class OldPolicyEMA:
     optimizer, mirrored into a bf16 model for the no-grad forward.
 
     A bf16 EMA cannot absorb 1e-6 updates, hence float32.
+
+    With LoRA, the bf16 copy also holds the merged weights (``merge_lora``),
+    refreshed after every update: θ_old only decodes and scores, and merged
+    it runs one matmul per adapted layer instead of three.
     """
 
     def __init__(self, optimizer, policy_model, old_model):
         names = {id(p): n for n, p in policy_model.named_parameters()}
         self.opt = optimizer
+        self.old_model = old_model
         self.old_params = [old_model.get_parameter(names[id(p)]) for p in optimizer.params]
         self.ema = {i: m.detach().clone() for i, m in optimizer.masters.items()}
         for p in old_model.parameters():
             p.requires_grad_(False)
+        self.merge = merge_lora if has_lora(old_model) else None
+        if self.merge:
+            self.merge(old_model)
 
     @torch.no_grad()
     def update(self, eta):
@@ -259,6 +269,8 @@ class OldPolicyEMA:
         if dist.is_initialized():
             for p, owner in zip(self.old_params, self.opt.owner):
                 dist.broadcast(p.data, src=owner)
+        if self.merge:
+            self.merge(self.old_model)
 
     def shard_state(self):
         return {i: e.detach().cpu() for i, e in self.ema.items()}

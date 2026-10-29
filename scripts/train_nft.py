@@ -27,14 +27,14 @@ from transformers import AutoTokenizer
 
 from src.lafa.modeling_lafa import LafaForCausalLM
 from src.rl.grpo import MasterAdamW, evaluate, gsm8k_reward
-from src.rl.lora import ADAPTER_CONFIG, add_lora, save_adapters
+from src.rl.lora import ADAPTER_CONFIG, add_lora, merge_lora, save_adapters, unmerge_lora
 from src.rl.nft import OldPolicyEMA, eta_schedule, nft_step, nft_terms
 from src.rl.nft_dn import dn_terms
 from src.rl.nft_v2 import nft_terms_v2
 from src.rl.ppo_lafa import ppo_lafa_terms
 from src.rl.tilt import tilt_terms
-from train_grpo import (init_wandb, other_live_job, reduce_sums, slurm_job_end, slurm_to_torch_env,
-                        wandb_row)
+from train_grpo import (init_wandb, log_wandb, other_live_job, reduce_sums, slurm_job_end,
+                        slurm_to_torch_env)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -287,13 +287,17 @@ def main():
         log.write(json.dumps(row) + '\n')
         log.flush()
         if wb:
-            wb.log(wandb_row(row, row['step'] * per_step / len(train_ids)))
+            log_wandb(wb, row, row['step'] * per_step / len(train_ids))
 
     def run_eval(step):
         # Validation decodes with θ (ODE). The SDE column of GRPO runs is not
         # meaningful here, so only the ODE is scored.
+        if args.lora_rank:
+            merge_lora(model)  # decode with one matmul per adapted layer
         sums = reduce_sums(evaluate(model, tokenizer, val_questions, num_steps=args.num_steps,
                                     max_new_tokens=args.max_new_tokens, sde_gamma=0.0), device)
+        if args.lora_rank:
+            unmerge_lora(model)
         if rank == 0:
             write(dict(kind='val', step=step, accuracy_ode=sums['correct'] / sums['count'],
                        tokens_ode=sums['tokens'] / sums['count'],
